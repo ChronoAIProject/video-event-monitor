@@ -285,15 +285,26 @@ For independent candidates, configure a **profile** provider target and
 `partition.key: per_event`. An existing-agent target shares its native context
 even with that partition. Keep stable event IDs for retries and business history
 in the destination. Optional `CMA_CONTEXT_CONFIG` JSON configures local idle-agent
-cleanup with `cma_url` (HTTPS public API base), its pinned `agent_profile_ids` list and
+cleanup with `cma_url` (HTTPS public `/api/v1` base), its pinned `agent_profile_ids` list and
 exclusive `workspace_id` and `grace_seconds` (300–86400; default 600). Set
 `CMA_CONTEXT_TOKEN` or its `_FILE` secret separately to an owner key restricted
 to the CMA service. Obtain IDs from actual owned resources; never configure a
-shared workspace or borrowed target. Cleanup requires workspace and immutable profile identity, checks readiness and age again before deletion, preserves
-working/approval states, and confirms the final resource status. Audit records
+shared workspace or borrowed target. Cleanup requires workspace and immutable profile identity,
+an old terminal transcript and an empty native v2 input queue. It rechecks actual
+turns before mutation: background `updated_at`/`through_seq` changes do not reset
+the grace period. Working, approval, unfinished and recent turns are preserved.
+Stop and Delete are asynchronous; cleanup polls the same Agent across scans,
+and increments `retired` only after reading `deleted`, including when deleted
+tombstones have already left the filtered inventory. `inflight` counts outstanding
+operations; an uncertain submission is retained for readback rather than replayed.
+It never controls the shared parent Sandbox or Workspace. Audit records
 remain under CMA retention. Operator health reports cleanup errors and counts.
 Inventory scans filter out deleted history and drain up to 50 resources per idle
 state per run; `scan_limited` reports when another page remains for later runs.
 This is disabled by default and does not authorize the worker to manage Agents.
+The configured credential must be accepted for child lifecycle operations through
+the chosen route. A successful inventory read does not prove that Stop/Delete are
+authorized. A NyxID-created-Sandbox admission refusal needs a supported lifecycle
+integration; do not disable that guard or put an owner's session JWT in HA options.
 
 See [reusable scenarios and live analysis edits](docs/scenarios.md) for shared workers, third-party templates and multiple workflows without per-analysis image releases.

@@ -28,6 +28,8 @@ class ContextCleanup:
             url = urlsplit(config.get(key, ""))
             if url.scheme != "https" or not url.hostname or url.username or url.password or url.query or url.fragment:
                 raise ValueError("CMA cleanup requires HTTPS service bases")
+            if not url.path.rstrip("/").endswith("/api/v1"):
+                raise ValueError("CMA cleanup requires the versioned /api/v1 base")
         for key, pattern in (("workspace_id", r"wks_[a-zA-Z0-9]{8,128}"),):
             if not re.fullmatch(pattern, config.get(key, "")):
                 raise ValueError("CMA cleanup requires exact channel and dedicated workspace")
@@ -42,8 +44,9 @@ class ContextCleanup:
         self.config, self.token = config, token
         self.opener = build_opener(NoRedirect)
         self.done = set()
+        self.inflight = {}
         self.status = {"enabled": True, "retired": 0, "pending": 0, "scan_limited": False,
-                       "last_success_at": None, "error": None}
+                       "inflight": 0, "last_success_at": None, "error": None}
 
     def call(self, base, path, method="GET"):
         headers = {"Authorization": "Bearer " + self.token, "User-Agent": "cma-context-cleanup/1"}
@@ -66,6 +69,7 @@ class ContextCleanup:
         except Exception as exc:
             # Never include URLs, bearer values, upstream bodies or event data.
             self.status["error"] = "http_" + str(exc.code) if isinstance(exc, HTTPError) else type(exc).__name__
+        self.status["inflight"] = len(self.inflight)
         return dict(self.status)
 
     def _run(self, now):
@@ -83,41 +87,87 @@ class ContextCleanup:
             for agent in page.get("items", [])[:50]:
                 agents[agent.get("id", "")] = agent
         self.status["scan_limited"] = limited
-        pending = 0
+        pending = set(self.inflight)
+        for aid in list(self.inflight):
+            self._advance(aid)
+            if aid in self.done:
+                pending.discard(aid)
         for agent in agents.values():
             aid = agent.get("id", "")
-            if not re.fullmatch(r"agt_[a-zA-Z0-9]{8,128}", aid) or aid in self.done:
-                continue
-            if agent.get("status") == "deleted":
-                self.done.add(aid)
-                self.status["retired"] += 1
-                continue
-            pending += 1
-            if agent.get("status") not in {"ready", "stopped", "failed"}:
-                continue
-            if agent["status"] != "stopped" and now - timestamp(agent["updated_at"]) < self.grace:
+            if (not re.fullmatch(r"agt_[a-zA-Z0-9]{8,128}", aid)
+                    or aid in self.done or aid in self.inflight):
                 continue
             if (agent.get("workspace_id") != cfg["workspace_id"]
                     or agent.get("profile", {}).get("id") not in cfg["agent_profile_ids"]):
                 continue
+            pending.add(aid)
+            if agent.get("status") not in {"ready", "stopped", "failed"}:
+                continue
+            transcript = self.call(cfg["cma_url"], "agents/" + aid + "/transcript")
+            if not self._idle(transcript, aid, now) or not self._queue_empty(aid):
+                continue
             # Recheck the resource immediately before mutation; never stop work
             # or a pending approval, and only act on the pinned profile in this dedicated workspace.
             detail = self.call(cfg["cma_url"], "agents/" + aid)
-            if detail["workspace"]["id"] != cfg["workspace_id"] or detail["status"] not in {"ready", "stopped", "failed"} or detail["profile"]["id"] not in cfg["agent_profile_ids"]:
+            if not self._owned(detail) or detail["status"] not in {"ready", "stopped", "failed"}:
                 continue
-            if detail["status"] != "stopped" and now - timestamp(detail["updated_at"]) < self.grace:
+            fresh = self.call(cfg["cma_url"], "agents/" + aid + "/transcript")
+            # through_seq and updated_at also advance for background maintenance.
+            # Compare actual turns and use terminal outcomes as the activity clock.
+            if (fresh.get("turns") != transcript.get("turns")
+                    or not self._idle(fresh, aid, now) or not self._queue_empty(aid)):
                 continue
-            if detail["status"] == "ready":
-                self.call(cfg["cma_url"], "agents/" + aid + "/stop", "POST")
-                stopped = self.call(cfg["cma_url"], "agents/" + aid)
-                if stopped["status"] != "stopped":
-                    continue
-            self.call(cfg["cma_url"], "agents/" + aid, "DELETE")
-            final = self.call(cfg["cma_url"], "agents/" + aid)
-            if final["status"] == "deleted":
-                self.done.add(aid)
-                self.status["retired"] += 1
-                pending -= 1
-        self.status["pending"] = pending
+            stage = "stopping" if detail["status"] == "ready" else "deleting"
+            # Retain uncertain submissions. Later scans only poll the same Agent;
+            # a timeout or HTTP 202 is never a reason to replay a mutation.
+            self._submit(aid, stage)
+        self.status["pending"] = len(pending)
+        self.status["inflight"] = len(self.inflight)
         if len(self.done) > 1000:
             self.done.clear()
+
+    def _owned(self, detail):
+        return (detail.get("workspace", {}).get("id") == self.config["workspace_id"]
+                and detail.get("profile", {}).get("id") in self.config["agent_profile_ids"])
+
+    def _idle(self, transcript, aid, now):
+        if transcript.get("agent_id") != aid or transcript.get("next"):
+            return False
+        turns = transcript.get("turns")
+        if not isinstance(turns, list) or not turns:
+            return False
+        for turn in turns:
+            outcome = turn.get("outcome", {})
+            if outcome.get("type") not in {"completed", "failed", "interrupted"}:
+                return False
+            if now - timestamp(outcome["at"]) < self.grace:
+                return False
+        return True
+
+    def _queue_empty(self, aid):
+        base = self.config["cma_url"].rstrip("/")[:-len("/v1")] + "/v2"
+        queue = self.call(base, "agents/" + aid + "/queued-inputs")
+        # The native v2 schema uses data/next_after, not items/next_cursor.
+        return queue.get("agent_id") == aid and queue.get("data") == [] and not queue.get("next_after")
+
+    def _advance(self, aid):
+        detail = self.call(self.config["cma_url"], "agents/" + aid)
+        if not self._owned(detail):
+            raise ValueError("CMA cleanup resource membership changed")
+        if detail["status"] == "deleted":
+            self.done.add(aid)
+            del self.inflight[aid]
+            self.status["retired"] += 1
+        elif self.inflight[aid] == "stopping" and detail["status"] == "stopped":
+            if self._queue_empty(aid):
+                self._submit(aid, "deleting")
+
+    def _submit(self, aid, stage):
+        self.inflight[aid] = stage
+        try:
+            self.call(self.config["cma_url"], "agents/" + aid + ("/stop" if stage == "stopping" else ""),
+                      "POST" if stage == "stopping" else "DELETE")
+        except HTTPError as exc:
+            if 400 <= exc.code < 500 and exc.code != 408:
+                del self.inflight[aid]
+            raise
